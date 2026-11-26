@@ -3,12 +3,17 @@ import AppKit
 import ServiceManagement
 import MontersshCore
 
-let ink = Color(red: 0.25, green: 0.36, blue: 0.49)
+let ink = Color(nsColor: NSColor(name: nil) { appearance in
+    appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        ? NSColor(calibratedRed: 0.58, green: 0.72, blue: 0.90, alpha: 1)
+        : NSColor(calibratedRed: 0.25, green: 0.36, blue: 0.49, alpha: 1)
+})
 struct ContentView: View {
     @EnvironmentObject var store: Store
     @State private var editor: Project?
     @State private var deleteProject: Project?
     @State private var confirmAll = false
+    @State private var forceProject: Project?
     @FocusState private var searching: Bool
     @Environment(\.scenePhase) private var phase
     let pages = [("Проекты", "square.grid.2x2"), ("Подключения", "externaldrive.badge.wifi"), ("Журнал событий", "clock.arrow.circlepath"), ("Настройки", "gearshape")]
@@ -58,8 +63,14 @@ struct ContentView: View {
         .alert("Monterssh", isPresented: Binding(get: { store.notice != nil }, set: { if !$0 { store.notice = nil } })) { Button("OK") { store.notice = nil } } message: { Text(store.notice ?? "") }
         .confirmationDialog("Отключить все SSHFS-диски? Сохраните открытые файлы.", isPresented: $confirmAll, titleVisibility: .visible) { Button("Отключить все") { Task { await store.disconnectAll() } }; Button("Отмена", role: .cancel) {} }
         .confirmationDialog("Удалить проект из приложения? Файлы сервера останутся на месте.", isPresented: Binding(get: { deleteProject != nil }, set: { if !$0 { deleteProject = nil } }), titleVisibility: .visible) { Button("Удалить", role: .destructive) { if let p = deleteProject { store.remove(p) }; deleteProject = nil } }
+        .confirmationDialog("Принудительно отключить диск? Несохранённые изменения могут быть потеряны.", isPresented: Binding(get: { forceProject != nil }, set: { if !$0 { forceProject = nil } }), titleVisibility: .visible) {
+            Button("Отключить принудительно", role: .destructive) { if let p = forceProject { Task { await store.disconnect(p.mountURL.path, project: p, force: true) } }; forceProject = nil }
+            Button("Отмена", role: .cancel) { forceProject = nil }
+        }
         .onChange(of: phase) { _, value in if value == .active { Task { await store.refresh() } } }
-        .onReceive(NotificationCenter.default.publisher(for: NSWorkspace.didMountNotification)) { _ in Task { await store.refresh() } }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in Task { await store.refresh() } }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in Task { await store.refresh() } }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in Task { await store.refresh() } }
         .background(Button("") { searching = true }.keyboardShortcut("k").hidden())
     }
     var subtitle: String { switch store.page { case "Настройки": "Удобное поведение приложения, без лишних действий."; case "Журнал событий": "История подключений и понятные сообщения об ошибках."; case "Подключения": "Все смонтированные SSHFS-диски, включая подключённые вне приложения."; default: "Ваши удалённые проекты. Всегда под рукой." } }
@@ -70,7 +81,7 @@ struct ContentView: View {
                 stat("SSHFS", MountService.sshfsExecutable == nil ? "Не найден" : "Готов", "Системный SSH Agent", "key")
                 stat("Фоновая работа", "Без опроса", "Обновление по событиям", "leaf")
             }
-            HStack { TextField("Найти проект или сервер…", text: $store.query).textFieldStyle(.roundedBorder).focused($searching); Picker("Фильтр", selection: $store.filter) { ForEach(["Все", "Избранные", "Активные"], id: \.self) { Text($0) } }.pickerStyle(.segmented).frame(width: 270) }
+            HStack { TextField("Найти проект или сервер…", text: $store.query).textFieldStyle(.roundedBorder).focused($searching); Picker("Фильтр", selection: $store.filter) { ForEach(["Все", "Избранные", "Активные"], id: \.self) { Text($0) } }.pickerStyle(.segmented).labelsHidden().frame(width: 270) }
             if store.projects.isEmpty { ContentUnavailableView { Label("Добавьте первый проект", systemImage: "externaldrive.badge.plus") } description: { Text("Импортируйте data.json из прежнего скрипта или добавьте сервер вручную.") } actions: { Button("Импортировать конфигурацию…") { store.importFile() } } }
             LazyVStack(spacing: 9) { ForEach(store.visible) { project in row(project) } }
             if !store.projects.isEmpty && store.visible.isEmpty { ContentUnavailableView.search(text: store.query) }
@@ -97,7 +108,7 @@ struct ContentView: View {
                 Button("Проверить SSH-соединение") { Task { do { store.notice = try await MountService.test(p) } catch { store.error = error.localizedDescription } } }
                 Button(p.favorite ? "Убрать из избранного" : "В избранное") { store.favorite(p) }
                 Button("Изменить…") { editor = p }.disabled(connected || busy)
-                if connected { Button("Принудительно отключить…", role: .destructive) { Task { await store.disconnect(p.mountURL.path, project: p, force: true) } } }
+                if connected { Button("Принудительно отключить…", role: .destructive) { forceProject = p } }
                 Divider(); Button("Удалить…", role: .destructive) { deleteProject = p }.disabled(connected || busy)
             } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).frame(width: 24)
         }.padding(14).background(.background, in: RoundedRectangle(cornerRadius: 12)).overlay(RoundedRectangle(cornerRadius: 12).stroke(.primary.opacity(0.06))).disabled(store.working)
