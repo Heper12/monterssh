@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import MontersshCore
 import ServiceManagement
+import Combine
 
 struct Event: Identifiable, Codable { var id = UUID(); var date = Date(); var title: String; var detail: String; var failed = false }
 @MainActor final class Store: ObservableObject {
@@ -22,11 +23,17 @@ struct Event: Identifiable, Codable { var id = UUID(); var date = Date(); var ti
     var configURL: URL { directory.appendingPathComponent("projects.json") }
     var active: [MountedVolume] { volumes.filter(\.isSSHFS) }
     var refreshing = false
+    private var observers = Set<AnyCancellable>()
     init() {
         do {
             if FileManager.default.fileExists(atPath: configURL.path) { projects = try ProjectFile.decode(Data(contentsOf: configURL)) }
             if let data = try? Data(contentsOf: directory.appendingPathComponent("events.json")), let saved = try? JSONDecoder().decode([Event].self, from: data) { events = saved }
         } catch { self.error = "Не удалось загрузить конфигурацию: \(error.localizedDescription). Исходный файл сохранён." }
+        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification, NSWorkspace.didWakeNotification] {
+            NSWorkspace.shared.notificationCenter.publisher(for: name).sink { [weak self] _ in
+                Task { @MainActor [weak self] in await self?.refresh() }
+            }.store(in: &observers)
+        }
     }
     func start() async { await refresh(); if autoConnect { for p in projects where p.favorite && !connected(p) { await connect(p) } } }
     func connected(_ p: Project) -> Bool { active.contains { $0.path == p.mountURL.path } }

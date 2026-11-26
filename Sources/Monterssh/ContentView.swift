@@ -68,9 +68,6 @@ struct ContentView: View {
             Button("Отмена", role: .cancel) { forceProject = nil }
         }
         .onChange(of: phase) { _, value in if value == .active { Task { await store.refresh() } } }
-        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in Task { await store.refresh() } }
-        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in Task { await store.refresh() } }
-        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in Task { await store.refresh() } }
         .background(Button("") { searching = true }.keyboardShortcut("k").hidden())
     }
     var subtitle: String { switch store.page { case "Настройки": "Удобное поведение приложения, без лишних действий."; case "Журнал событий": "История подключений и понятные сообщения об ошибках."; case "Подключения": "Все смонтированные SSHFS-диски, включая подключённые вне приложения."; default: "Ваши удалённые проекты. Всегда под рукой." } }
