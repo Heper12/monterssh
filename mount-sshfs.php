@@ -1,29 +1,28 @@
 <?php
 
-$current_user = get_current_user();
 $home_dir = getenv('HOME');
 
 $config_file = __DIR__ . '/data.json';
 $pids = [];
 $active_mount_points = [];
-$stale_mount_points = [];
 $just_mounted = [];
 $just_added = null;
 
-define('VERSION', '2.2.0-macOS');
-define('RELEASE_DATE', '2026-02-26');
+define('VERSION', '2.3.0-macOS');
+define('RELEASE_DATE', '2026-11-26');
 define('MOUNT_DIR', '/Volumes/');
 
 function load_config()
 {
     global $config_file;
     if (!file_exists($config_file)) {
-        file_put_contents($config_file, '{}');
+        file_put_contents($config_file, "[]\n");
     }
     $config = file_get_contents($config_file);
-    if (!$config) fatal_error('Failed to read file', $config_file);
+    if ($config === false) fatal_error('Failed to read file', $config_file);
     $array = json_decode($config, true);
-    return array_values($array ?: []);
+    if (!is_array($array)) fatal_error('Invalid JSON configuration', json_last_error_msg());
+    return array_values($array);
 }
 
 function save_config()
@@ -35,8 +34,9 @@ function save_config()
 function readln($prompt = null, $reset = false)
 {
     if ($prompt) echo $prompt;
-    $fp = fopen("php://stdin","r");
-    $line = rtrim(fgets($fp, 1024));
+    $input = fgets(STDIN);
+    if ($input === false) return false;
+    $line = rtrim($input, "\r\n");
     if ($reset) reset_line(1);
     return $line;
 }
@@ -72,7 +72,9 @@ function fatal_error($message, $info = '')
 
 function reset_line($n = 0)
 {
-    $cols = (int)exec('tput cols');
+    $cols_output = [];
+    exec('tput cols 2>/dev/null', $cols_output);
+    $cols = (int)($cols_output[0] ?? 80);
     if ($n) echo chr(27) . '[0G' . chr(27) . '[' . $n . 'A';
     printf("%s\r", str_repeat(' ', $cols));
 }
@@ -84,25 +86,114 @@ function warning($message, $info = '')
     if ($info) printf("%s %s\n", cc(204, ':'), $info); else echo "\n";
 }
 
-// macOS-специфичная проверка монтирования
+function normalize_mount_path($mount_point)
+{
+    $mount_point = trim((string)$mount_point);
+    $mount_point = preg_replace('~^/volumes/~i', '/Volumes/', $mount_point);
+    if (str_starts_with($mount_point, '/Volumes/')) {
+        $relative = substr($mount_point, strlen('/Volumes/'));
+    } else {
+        if ($mount_point === '' || str_starts_with($mount_point, '/')) return false;
+        $relative = $mount_point;
+    }
+    $parts = explode('/', trim($relative, '/'));
+    if (!$parts || in_array('', $parts, true) || in_array('.', $parts, true) || in_array('..', $parts, true)) return false;
+    return '/Volumes/' . implode('/', $parts);
+}
+
+function mounted_filesystems()
+{
+    exec('mount 2>/dev/null', $lines, $status);
+    return $status === 0 ? $lines : [];
+}
+
+function mount_line_path($line)
+{
+    if (preg_match('~ on (/Volumes/.*?) \(~', $line, $matches)) return str_replace('\\040', ' ', $matches[1]);
+    return null;
+}
+
 function is_mounted_macos($mount_point)
 {
-    $output = shell_exec("mount 2>/dev/null | grep -F ' " . escapeshellarg($mount_point) . " '");
-    return !empty(trim((string)$output));
+    $mount_point = normalize_mount_path($mount_point);
+    if (!$mount_point) return false;
+    foreach (mounted_filesystems() as $line) {
+        if (mount_line_path($line) === $mount_point) return true;
+    }
+    return false;
+}
+
+function mounted_sshfs_paths()
+{
+    $paths = [];
+    foreach (mounted_filesystems() as $line) {
+        $path = mount_line_path($line);
+        $sshfs_source = preg_match('~^[^ ]+:.+ on /Volumes/~', $line);
+        $fuse_filesystem = preg_match('/(sshfs|osxfuse|macfuse)/i', $line);
+        if ($path && $sshfs_source && $fuse_filesystem) $paths[] = $path;
+    }
+    return array_values(array_unique($paths));
+}
+
+function ensure_mount_dir($mount_point)
+{
+    global $home_dir;
+    $identity = function_exists('posix_geteuid') && function_exists('posix_getpwuid')
+        ? posix_getpwuid(posix_geteuid())
+        : false;
+    $username = is_array($identity) ? ($identity['name'] ?? '') : basename($home_dir ?: '');
+    if ($username === '') {
+        warning('Could not determine current user');
+        return false;
+    }
+    $output = [];
+    $command = 'sudo mkdir -p ' . escapeshellarg($mount_point)
+        . ' && sudo chown ' . escapeshellarg($username . ':staff') . ' ' . escapeshellarg($mount_point);
+    exec($command . ' 2>&1', $output, $status);
+    if ($status !== 0 || !is_dir($mount_point)) {
+        warning('Could not create mount directory', implode("\n", $output) ?: $mount_point);
+        return false;
+    }
+    return true;
+}
+
+function identity_file_for_key($key_name)
+{
+    global $home_dir;
+    $key_name = trim((string)$key_name);
+    if (str_ends_with($key_name, '.pub')) $key_name = substr($key_name, 0, -4);
+    return str_starts_with($key_name, '/') ? $key_name : rtrim($home_dir, '/') . '/.ssh/' . $key_name;
+}
+
+function unmount_path($mount_point)
+{
+    $mount_point = normalize_mount_path($mount_point);
+    if (!$mount_point || !is_mounted_macos($mount_point)) return true;
+    $output = [];
+    exec('sudo diskutil unmount force ' . escapeshellarg($mount_point) . ' 2>&1', $output, $status);
+    if ($status === 0 && !is_mounted_macos($mount_point)) return true;
+    $fallback = [];
+    exec('sudo umount ' . escapeshellarg($mount_point) . ' 2>&1', $fallback, $fallback_status);
+    if ($fallback_status === 0 && !is_mounted_macos($mount_point)) return true;
+    warning('Could not unmount', implode("\n", array_filter(array_merge($output, $fallback))) ?: $mount_point);
+    return false;
 }
 
 function print_list()
 {
-    global $db, $commands, $active_mount_points, $stale_mount_points, $just_mounted, $just_added;
+    global $db, $commands, $just_mounted, $just_added;
     $line_width = 40;
 
     if (!empty($db)) {
         pgrep_list();
         $i = 0;
-        $stale_mount_points = [];
         printf("%s\n", str_repeat('─', $line_width));
         foreach ($db as $key => $arr) {
-            $mount_point = MOUNT_DIR . $arr['mount_point'];
+            $mount_point = normalize_mount_path($arr['mount_point'] ?? '');
+            if (!$mount_point) {
+                printf(" % 2d. %s\n", ++$i, cc(210, 'Invalid mount point: ' . ($arr['mount_point'] ?? '')));
+                continue;
+            }
             $is_mounted = is_mounted_macos($mount_point);
 
             $default_cc = 245;
@@ -112,16 +203,7 @@ function print_list()
             if (!empty($just_added) && $arr['mount_point'] == $just_added)
                 $default_cc = 81;
 
-            if (!$is_mounted) {
-                if (in_array($mount_point . '/', $active_mount_points) || is_mounted_macos($mount_point . '/')) {
-                    kill_mount($key);
-                    $is_mounted = is_mounted_macos($mount_point);
-                }
-                if (!$is_mounted) {
-                    $stale_mount_points[] = $mount_point;
-                    $cc = 210;
-                }
-            }
+            if (!$is_mounted) $cc = 210;
             $color = $is_mounted ? $cc : $default_cc;
             printf(" % 2d. %s\n", ++$i, cc($color, $arr['mount_point']));
         }
@@ -132,58 +214,37 @@ function print_list()
 
 function pgrep_list($show_info = false, $command_index = null)
 {
-    global $db, $commands, $pids, $active_mount_points;
+    global $db, $pids, $active_mount_points;
 
     if (!empty($command_index)) {
-        $info = $db[$command_index - 1];
+        $entry_index = (int)$command_index - 1;
+        if (!array_key_exists($entry_index, $db)) { warning('Invalid entry index', $command_index); return; }
+        $info = $db[$entry_index];
         $maxlength = 0;
         printf("\nEntry %s: %s\n\n", cc('underline', '#' . $command_index), cc('bold 81', $info['mount_point']));
-        foreach ($info as $key => $value)
-            if (strlen($key) > $maxlength) $maxlength = strlen($key);
-        foreach ($info as $key => $value) {
-            printf("  %s%s: %s\n", str_repeat(' ', $maxlength - strlen($key)), $key, cc(228, $value));
-        }
+        foreach ($info as $key => $value) $maxlength = max($maxlength, strlen($key));
+        foreach ($info as $key => $value) printf("  %s%s: %s\n", str_repeat(' ', $maxlength - strlen($key)), $key, cc(228, $value));
         print("\n");
         return;
     }
 
     $pids = [];
-    $active_mount_points = [];
-    exec('ps ax -o pid,command | grep -i sshfs | grep -v grep', $pgrep_output);
-    $pgrep_output = array_filter(array_map('trim', $pgrep_output));
-
-    if (!empty($pgrep_output)) {
-        if ($show_info) printf("\n%s\n\n", cc('italic', 'Active connections:'));
-        foreach ($pgrep_output as $pgrep) {
-            if (preg_match('/^\s*(?<pid>\d+)\s+.*?sshfs\s+(?:(?:-o\s+\S+\s+)*?)?(?<username>[^@]+)@(?<host>[^:]+):(?<path>\S+).*?(?<mount>\/Volumes\/\S+)/i', $pgrep, $m)) {
-                $pid = (int)$m['pid'];
-                $mount = rtrim($m['mount'], '/');
-                $pids[] = $pid;
-                $active_mount_points[$pid] = $mount . '/';
-                if ($show_info) {
-                    printf("  pid: %s\n", cc(197, $pid));
-                    printf("  %s\n", cc(220, $mount));
-                    printf("  %s\n\n", cc(38, $m['path']));
-                }
-            } elseif (preg_match('/^\s*(?<pid>\d+)\s+.*?(?<mount>\/Volumes\/\S+)/', $pgrep, $m)) {
-                $pid = (int)$m['pid'];
-                $mount = rtrim($m['mount'], '/');
-                if (!in_array($pid, $pids)) {
-                    $pids[] = $pid;
-                    $active_mount_points[$pid] = $mount . '/';
-                    if ($show_info) {
-                        printf("  pid: %s\n", cc(197, $pid));
-                        printf("  %s\n\n", cc(220, $mount));
-                    }
-                }
-            }
-        }
-    } else printf("%s\n", cc('italic', 'No sshfs process found'));
+    $active_mount_points = mounted_sshfs_paths();
+    if (!$show_info) return;
+    if (empty($active_mount_points)) {
+        printf("%s\n", cc('italic', 'No active SSHFS mount points'));
+        return;
+    }
+    printf("\n%s\n\n", cc('italic', 'Active SSHFS mount points:'));
+    foreach ($active_mount_points as $mount_point) printf("  %s\n", cc(220, $mount_point));
+    print("\n");
 }
 
 function clear_line()
 {
-    $cols = intval(`tput cols`);
+    $cols_output = [];
+    exec('tput cols 2>/dev/null', $cols_output);
+    $cols = (int)($cols_output[0] ?? 80);
     printf("\r%s\r", str_repeat(' ', $cols));
 }
 
@@ -278,27 +339,15 @@ function exec_timeout($cmd, $timeout) {
 }
 
 function kill_mount($index) {
-    global $db, $active_mount_points;
-    $mount_point = MOUNT_DIR . rtrim($db[$index]['mount_point'], '/') . '/';
-    $pid = array_search($mount_point, $active_mount_points);
-    if ($pid) {
-        printf("\n%s %s (%s)\n", cc('bold underline 225', 'kill:'), cc(220, $db[$index]['mount_point']), cc(210, $pid));
-        $cmd = "sudo kill -9 $pid";
-        printf("Running command:\n%s\n", cc([197, 'bold'], $cmd));
-        exec($cmd);
+    global $db;
+    $mount_point = normalize_mount_path($db[$index]['mount_point'] ?? '');
+    if (!$mount_point) { warning('Invalid mount point', $db[$index]['mount_point'] ?? ''); return false; }
+    if (!is_mounted_macos($mount_point)) {
+        printf("%s %s\n", cc(245, 'Not mounted:'), $mount_point);
+        return true;
     }
-    $cmd = "sudo diskutil unmount force " . escapeshellarg($mount_point);
-    printf("Running command:\n%s\n", cc([197, 'bold'], $cmd));
-    exec($cmd, $cmd_output);
-    $cmd_output = array_filter($cmd_output ?? []);
-    exec("sudo umount " . escapeshellarg($mount_point) . " 2>/dev/null");
-}
-
-function sudo_mkdir($mount_point) {
-    global $current_user;
-    $mount_point = preg_replace('~^/volumes/~i', '/Volumes/', $mount_point);
-    printf("Directory %s not exists, creating\n", cc(220, $mount_point));
-    exec(sprintf('sudo mkdir -p "%1$s" && sudo chown %2$s:staff "%1$s"', $mount_point, $current_user));
+    printf("%s %s\n", cc('bold underline 225', 'Unmounting'), cc(220, $mount_point));
+    return unmount_path($mount_point);
 }
 
 $db = load_config();
@@ -308,7 +357,9 @@ $commands = [
     'edit'     => 'Edit entry (edit <index>)',
     'delete'   => 'Delete entry (delete <index>)',
     'kill'     => 'Kill connection (kill <index>)',
-    'kill all' => 'Kill all active connections',
+    'kill all' => 'Unmount all active SSHFS mount points',
+    'unmount'  => 'Unmount connection (unmount <index>)',
+    'mounts'   => 'Show active SSHFS mount points',
     'list'     => 'Refresh list of entries',
     'info'     => 'Show active connections or (if info <index>) show entry info',
     'help'     => 'This help',
@@ -327,6 +378,7 @@ while (true) {
     }
     input:
     $input = readln('monterssh> ');
+    if ($input === false) exit(0);
     if ($input === '') goto input;
     process:
 
@@ -344,34 +396,41 @@ while (true) {
         $success = false; $just_mounted = []; $just_added = null;
         foreach ($indexes as $index) {
             if (!array_key_exists($index, $db)) { warning('Invalid index', $index + 1); continue; }
-            $mount_dir = MOUNT_DIR . $db[$index]['mount_point'];
-            if (in_array($mount_dir, $stale_mount_points)) kill_mount($index);
-            if (!file_exists($mount_dir)) sudo_mkdir($mount_dir);
-
-            $cmd = sprintf('sshfs %s@%s:%s -p %d -o IdentityFile=~/.ssh/%s,reconnect,ServerAliveInterval=60,ServerAliveCountMax=3,allow_other,defer_permissions,volname=%s "%s" 2>&1 &',
-                $db[$index]['username'], $db[$index]['host'], $db[$index]['path'],
-                $db[$index]['port'], $db[$index]['rsa'], $db[$index]['mount_point'], $mount_dir);
-            $mount_point = MOUNT_DIR . $db[$index]['mount_point'];
-            $retries = 0;
-            sshfs_retry:
-            unset($cmd_output); exec($cmd, $cmd_output);
-            if (!empty($cmd_output)) {
-                printf("%s\n", cc(210, implode("\n", $cmd_output)));
-                if (preg_match('/(Permission denied|Transport endpoint is not connected|osxfuse: the mount point is invalid)/', implode(' ', $cmd_output))) {
-                    printf("Unmounting %s\n", cc(220, $mount_point));
-                    unset($umount_output);
-                    exec('sudo diskutil unmount force ' . escapeshellarg($mount_point) . ' 2>&1', $umount_output);
-                    if (empty($umount_output)) exec('sudo umount ' . escapeshellarg($mount_point) . ' 2>&1', $umount_output);
-                    if (!empty($umount_output)) printf("%s\n", cc(210, implode("\n", $umount_output)));
-                    $retries++;
-                    if ($retries === 3) { printf("%s\n", cc(210, 'Exceeded amount of retries (3)')); }
-                    else goto sshfs_retry;
-                }
-            } else {
-                $just_mounted[] = $mount_point;
-                printf("%s: %s\n", cc(82, 'Successfully mounted'), cc(220, $mount_point));
-                $success = true;
+            $mount_dir = normalize_mount_path($db[$index]['mount_point'] ?? '');
+            if (!$mount_dir) { warning('Invalid mount point', $db[$index]['mount_point'] ?? ''); continue; }
+            if (is_mounted_macos($mount_dir)) {
+                printf("%s %s\n", cc(245, 'Already mounted:'), $mount_dir);
+                continue;
             }
+            if (!ensure_mount_dir($mount_dir)) continue;
+
+            $port = filter_var($db[$index]['port'] ?? 22, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 65535]]);
+            $username = trim((string)($db[$index]['username'] ?? ''));
+            $host = trim((string)($db[$index]['host'] ?? ''));
+            $remote_path = (string)($db[$index]['path'] ?? '');
+            $key_name = trim((string)($db[$index]['rsa'] ?? ''));
+            if (!$port || !$username || !$host || !$key_name) {
+                warning('Incomplete SSH configuration', $db[$index]['mount_point']);
+                continue;
+            }
+            $identity_file = identity_file_for_key($key_name);
+            if (!is_file($identity_file)) { warning('SSH key not found', $identity_file); continue; }
+
+            $options = implode(',', [
+                'IdentityFile=' . $identity_file,
+                'reconnect', 'ServerAliveInterval=60', 'ServerAliveCountMax=3',
+                'allow_other', 'defer_permissions', 'volname=' . basename($mount_dir),
+            ]);
+            $remote = $username . '@' . $host . ':' . $remote_path;
+            $cmd = 'sshfs ' . escapeshellarg($remote) . ' -p ' . $port . ' -o ' . escapeshellarg($options) . ' ' . escapeshellarg($mount_dir) . ' 2>&1';
+            exec($cmd, $cmd_output, $exit_code);
+            if ($exit_code !== 0 || !is_mounted_macos($mount_dir)) {
+                warning('SSHFS mount failed', implode("\n", $cmd_output) ?: 'sshfs exited without mounting');
+                continue;
+            }
+            $just_mounted[] = $mount_dir;
+            printf("%s: %s\n", cc(82, 'Successfully mounted'), cc(220, $mount_dir));
+            $success = true;
         }
         if ($success) print_list();
     } else {
@@ -379,8 +438,11 @@ while (true) {
         if (preg_match('/^(.+) (\d+)$/', $command, $m)) { $command = $m[1]; $command_index = $m[2]; }
         switch ($command) {
             case 'new': case 'add':
-            exec("find /Users/{$current_user}/.ssh -type f -name '*.pub'", $find_output);
-            $find_output = array_map(fn($x) => preg_replace('~^.+/~', '', $x), $find_output);
+            $find_output = [];
+            foreach (glob(rtrim($home_dir, '/') . '/.ssh/*.pub') ?: [] as $public_key) {
+                $private_key = substr($public_key, 0, -4);
+                if (is_file($private_key)) $find_output[] = basename($private_key);
+            }
             clear_line(); print(PHP_EOL);
             $login = readln(sprintf("\t%s ", cc(248, 'ssh username:')));
             $host = readln(sprintf("\t%s ", cc(248, 'ssh host:')));
@@ -388,15 +450,13 @@ while (true) {
             $mount_point = readln(sprintf("\t%s ", cc(248, 'mount point:')));
             $port = 22; $id_rsa = null;
             print(PHP_EOL);
-            foreach ($find_output as $key => $pub) {
-                $color = 219;
-                if ($pub == 'id_rsa.pub') { $find_output[$key] = 'id_rsa'; $id_rsa = $key; $color = 82; }
-                printf("\t%d. %s\n", $key, cc($color, $pub));
+            foreach ($find_output as $key => $key_name) {
+                $color = ($key_name === 'id_rsa') ? 82 : 219;
+                if ($key_name === 'id_rsa') $id_rsa = $key;
+                printf("\t%d. %s\n", $key, cc($color, $key_name));
             }
             $pub_index = readln("\npublic key (index): ", true);
             if (!$pub_index) $pub_index = $id_rsa;
-            $mount_dir = MOUNT_DIR . preg_replace('~^' . MOUNT_DIR . '~', '', $mount_point);
-            if (!file_exists($mount_dir)) sudo_mkdir($mount_dir);
             $rsa = $find_output[$pub_index] ?? $find_output[0] ?? 'id_rsa';
             print("New entry saved!\n");
             printf("   username: %s\n       host: %s\n       path: %s\n       port: %s\n  pub_index: %s\nmount_point: %s\n\n",
@@ -424,9 +484,7 @@ while (true) {
                 edit:
                 $login = readln('ssh username: '); $host = readln('ssh host: '); $path = readln('ssh remote path: ');
                 $rsa = readln('public key: '); $mount_point = readln('mount point: ');
-                $mount_dir = MOUNT_DIR . preg_replace('~^' . MOUNT_DIR . '~', '', $mount_point);
-                if (!file_exists($mount_dir)) sudo_mkdir($mount_dir);
-                if ($rsa && !file_exists($home_dir . '/.ssh/' . $rsa)) { printf("%s %s\n", cc(210, 'File not found:'), $rsa); goto edit; }
+                if ($rsa && !is_file(identity_file_for_key($rsa))) { printf("%s %s\n", cc(210, 'Private key not found:'), $rsa); goto edit; }
                 print("Successful edit!\n");
                 $keys = ['username','host','path','rsa','mount_point'];
                 foreach ($keys as $key) {
@@ -444,21 +502,27 @@ while (true) {
                     kill_mount($index); print_list();
                 } break;
 
+            case 'unmount':
+                if (!$command_index) $command_index = readln(sprintf('%s index (1-%d): ', cc('bold underline 225', 'unmount'), count($db)));
+                $index = (int)$command_index - 1;
+                if (!array_key_exists($index, $db)) { warning('Invalid index', $command_index); goto input; }
+                kill_mount($index); print_list(); break;
+
             case 'kill all':
-                if (empty($pids)) { warning('no PIDs available'); }
-                else {
-                    $cmd = sprintf('sudo kill -9 %s', implode(' ', $pids));
-                    printf("Running command:\n%s\n", cc([197, 'bold'], $cmd)); exec($cmd);
-                    foreach ($db as $arr) {
-                        $mp = MOUNT_DIR . $arr['mount_point'];
-                        $cmd = "sudo diskutil unmount force " . escapeshellarg($mp);
-                        printf("Running command:\n%s\n", cc([197, 'bold'], $cmd)); exec($cmd);
-                        exec("sudo umount " . escapeshellarg($mp) . " 2>/dev/null");
-                    }
-                    print_list();
-                } break;
+                $mount_points = mounted_sshfs_paths();
+                if (empty($mount_points)) printf("%s\n", cc('italic', 'No active SSHFS mount points'));
+                foreach ($mount_points as $mount_point) {
+                    printf("%s %s\n", cc('bold underline 225', 'Unmounting'), cc(220, $mount_point));
+                    unmount_path($mount_point);
+                }
+                print_list(); break;
 
             case 'list': print_list(); break;
+            case 'mounts':
+                $mount_points = mounted_sshfs_paths();
+                if (empty($mount_points)) printf("%s\n", cc('italic', 'No active SSHFS mount points'));
+                else foreach ($mount_points as $mount_point) printf(" - %s\n", cc(220, $mount_point));
+                break;
             case 'info': pgrep_list(true, $command_index); break;
             case 'sort': sort_list(); print_list(); break;
             case 'version': print_version(); break;
