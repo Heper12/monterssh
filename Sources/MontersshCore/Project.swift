@@ -19,6 +19,7 @@ public struct Project: Identifiable, Codable, Equatable, Sendable {
         var p = self
         p.mountPoint = p.mountPoint.trimmingCharacters(in: .whitespacesAndNewlines)
         if p.mountPoint.lowercased().hasPrefix("/volumes/") { p.mountPoint = String(p.mountPoint.dropFirst(9)) }
+        else if p.mountPoint.hasPrefix("/") { throw AppError.message("Точка монтирования должна находиться внутри /Volumes.") }
         p.mountPoint = p.mountPoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let parts = p.mountPoint.split(separator: "/", omittingEmptySubsequences: false)
         guard !p.mountPoint.isEmpty, !parts.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }), !p.mountPoint.contains("\n"), !p.mountPoint.contains(",") else { throw AppError.message("Укажите корректное имя диска внутри /Volumes, без .. и запятых.") }

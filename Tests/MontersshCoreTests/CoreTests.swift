@@ -13,7 +13,7 @@ final class CoreTests: XCTestCase {
         try ProjectFile.save([p], to: url); XCTAssertEqual(try ProjectFile.decode(Data(contentsOf: url)), [p])
     }
     func testUnsafePathsRejected() {
-        for path in ["../bad", "folder/../bad", "/", "bad,,", "a//b", "/Volumes/"] {
+        for path in ["../bad", "folder/../bad", "/", "bad,,", "a//b", "/Volumes/", "/tmp/site"] {
             XCTAssertThrowsError(try Project(username: "demo", host: "example.test", mountPoint: path).validated(), path)
         }
     }

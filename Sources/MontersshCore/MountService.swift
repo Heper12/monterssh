@@ -59,7 +59,6 @@ public enum MountService {
     // AppleScript invokes only a fixed mkdir/chown recipe with independently escaped paths.
     public static func shellQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
     static func ensureDirectory(_ path: String) async throws {
-        if FileManager.default.isWritableFile(atPath: path) { return }
         let components = path.dropFirst("/Volumes/".count).split(separator: "/")
         var current = "/Volumes"
         for component in components {
@@ -70,6 +69,7 @@ public enum MountService {
                 guard isDir.boolValue, attrs[.type] as? FileAttributeType != .typeSymbolicLink else { throw AppError.message("Точка монтирования содержит файл или символьную ссылку: \(current)") }
             }
         }
+        if FileManager.default.isWritableFile(atPath: path) { return }
         let command = "/bin/mkdir -p " + shellQuote(path) + " && /usr/sbin/chown " + shellQuote(String(getuid()) + ":" + String(getgid())) + " " + shellQuote(path)
         let escaped = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let result = try await CommandRunner.run("/usr/bin/osascript", ["-e", "do shell script \"\(escaped)\" with administrator privileges"], timeout: 120)
