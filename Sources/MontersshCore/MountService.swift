@@ -14,12 +14,23 @@ public enum CommandRunner {
                 process.environment = env
                 do {
                     try process.run()
-                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+                    let deadline = DispatchWorkItem {
                         if process.isRunning { process.terminate()
                             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) { if process.isRunning { kill(process.processIdentifier, SIGKILL) } }
                         }
                     }
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: deadline)
+                    defer { deadline.cancel() }
+                    var data = Data()
+                    while true {
+                        let count = try autoreleasepool {
+                            guard let chunk = try pipe.fileHandleForReading.read(upToCount: 16_384), !chunk.isEmpty else { return 0 }
+                            let remaining = 128_000 - data.count
+                            if remaining > 0 { data.append(chunk.prefix(remaining)) }
+                            return chunk.count
+                        }
+                        if count == 0 { break }
+                    }
                     process.waitUntilExit()
                     continuation.resume(returning: CommandResult(status: process.terminationStatus, output: String(decoding: data.prefix(128_000), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)))
                 } catch { continuation.resume(throwing: error) }
@@ -70,6 +81,10 @@ public enum MountService {
             }
         }
         if FileManager.default.isWritableFile(atPath: path) { return }
+        do {
+            try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+            if FileManager.default.isWritableFile(atPath: path) { return }
+        } catch { /* /Volumes is normally owned by root; fall through to macOS authorization. */ }
         let command = "/bin/mkdir -p " + shellQuote(path) + " && /usr/sbin/chown " + shellQuote(String(getuid()) + ":" + String(getgid())) + " " + shellQuote(path)
         let escaped = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let result = try await CommandRunner.run("/usr/bin/osascript", ["-e", "do shell script \"\(escaped)\" with administrator privileges"], timeout: 120)

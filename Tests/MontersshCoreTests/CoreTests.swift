@@ -6,6 +6,24 @@ func XCTAssertTrue(_ v: Bool) { precondition(v) }
 func XCTAssertThrowsError<T>(_ expression: @autoclosure () throws -> T, _ message: String) { do { _ = try expression(); preconditionFailure("Expected error: " + message) } catch {} }
 @main struct CoreTests {
     static func main() async throws {
+        if CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--live-check" {
+            let projects = try ProjectFile.decode(Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2])))
+            let active = try await MountService.volumes().filter(\.isSSHFS)
+            guard var project = projects.first(where: { p in active.contains(where: { $0.path == p.mountURL.path }) }) else { throw AppError.message("No matching active project for live verification") }
+            let root = URL(fileURLWithPath: CommandLine.arguments[3])
+            guard root.path.hasPrefix("/Volumes/"), FileManager.default.isWritableFile(atPath: root.path) else { throw AppError.message("Live test root must be a writable directory inside /Volumes") }
+            let folder = root.appendingPathComponent("monterssh-check-" + UUID().uuidString)
+            project.mountPoint = String(folder.path.dropFirst(9))
+            print("LIVE: testing SSH access without modifying remote files")
+            print(try await MountService.test(project))
+            try await MountService.connect(project)
+            let snapshot = try await MountService.volumes()
+            precondition(snapshot.contains(where: { $0.path == folder.path && $0.isSSHFS }))
+            try await MountService.disconnect(folder.path)
+            try FileManager.default.removeItem(at: folder)
+            print("PASS: live SSH test, isolated mount and ordinary unmount; original mount preserved")
+            return
+        }
         let tests = CoreTests()
         try tests.testLegacyImportAndRoundTrip(); tests.testUnsafePathsRejected()
         tests.testMountParsingAndFilesystemIsolation(); try tests.testArgumentsPreserveShellCharacters()
@@ -53,5 +71,11 @@ func XCTAssertThrowsError<T>(_ expression: @autoclosure () throws -> T, _ messag
         XCTAssertEqual(good.status, 0); XCTAssertEqual(good.output, "hello")
         let bad = try await CommandRunner.run("/usr/bin/false", [])
         XCTAssertNotEqual(bad.status, 0)
+        let large = try await CommandRunner.run("/usr/bin/head", ["-c", "10000000", "/dev/zero"])
+        XCTAssertEqual(large.output.utf8.count, 128_000)
+        let start = Date()
+        let timed = try await CommandRunner.run("/bin/sleep", ["5"], timeout: 0.1)
+        XCTAssertNotEqual(timed.status, 0)
+        XCTAssertTrue(Date().timeIntervalSince(start) < 3)
     }
 }
