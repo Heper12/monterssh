@@ -65,5 +65,5 @@ macOS запросит администратора.
 Проверки ядра:
 
 ```sh
-swift test
+swift run CoreChecks
 ```

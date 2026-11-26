@@ -1,6 +1,17 @@
-import XCTest
-@testable import MontersshCore
-final class CoreTests: XCTestCase {
+import Foundation
+import MontersshCore
+func XCTAssertEqual<T: Equatable>(_ a: T, _ b: T) { precondition(a == b, "Expected equal: \(a) vs \(b)") }
+func XCTAssertNotEqual<T: Equatable>(_ a: T, _ b: T) { precondition(a != b) }
+func XCTAssertTrue(_ v: Bool) { precondition(v) }
+func XCTAssertThrowsError<T>(_ expression: @autoclosure () throws -> T, _ message: String) { do { _ = try expression(); preconditionFailure("Expected error: " + message) } catch {} }
+@main struct CoreTests {
+    static func main() async throws {
+        let tests = CoreTests()
+        try tests.testLegacyImportAndRoundTrip(); tests.testUnsafePathsRejected()
+        tests.testMountParsingAndFilesystemIsolation(); try tests.testArgumentsPreserveShellCharacters()
+        try await tests.testProcessRunnerDrainsOutputAndReportsFailure()
+        print("PASS: import, storage round-trip, unsafe paths, mount parsing, filesystem isolation, argument quoting, process success/failure")
+    }
     func testLegacyImportAndRoundTrip() throws {
         let json = """
         [{"username":"demo","host":"example.test","path":"/www","port":"2222","rsa":"id_ed25519.pub","mount_point":"/Volumes/site"}]
